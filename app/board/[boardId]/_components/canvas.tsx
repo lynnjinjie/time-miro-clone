@@ -11,7 +11,7 @@ interface CanvasProps {
 export default function Canvas({ boardId }: CanvasProps) {
   return (
     <main className="w-full h-full relative bg-neutral-100 touch-none">
-      <Info />
+      <Info boardId={boardId} />
       <Participants />
       <Toolbar />
     </main>
