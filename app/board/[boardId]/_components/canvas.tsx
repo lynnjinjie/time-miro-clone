@@ -34,6 +34,7 @@ import Toolbar from './toolbar'
 import { CursorsPresence } from './cursors-presence'
 import { LayerPreview } from './layer-preview'
 import { SelectionBox } from './selection-box'
+import { SelectionTools } from './selection-tools'
 
 const MAX_LAYERS = 100
 
@@ -267,6 +268,7 @@ export default function Canvas({ boardId }: CanvasProps) {
         undo={history.undo}
         redo={history.redo}
       />
+      <SelectionTools camera={camera} setLastUserColor={setLastUserColor} />
       <svg
         className="w-screen h-screen"
         onWheel={onWheel}
