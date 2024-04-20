@@ -46,7 +46,7 @@ export const SelectionTools = memo(function SelectionTools({
       const layerIds = storage.get('layerIds')
       const indices: number[] = []
 
-      const arr = layerIds.toArray()
+      const arr = layerIds.toImmutable()
       for (let i = 0; i < arr.length; i++) {
         if (selection.includes(arr[i])) {
           indices.push(i)

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import { LiveObject } from '@liveblocks/client'
 
@@ -21,13 +21,18 @@ import {
   useMutation,
   useStorage,
   useOthersMapped,
+  useSelf,
 } from '@/liveblocks.config'
 import {
   connectionIdToColor,
   findIntersectingLayersWithRectangle,
+  penPointsToPathLayer,
   pointerEventToCanvasPoint,
   resizeBounds,
+  rgbToHex,
 } from '@/lib/utils'
+import { useDisableScrollBounce } from '@/hooks/use-disable-scroll-bounce'
+import { useDeleteLayers } from '@/hooks/use-delete-layers'
 
 import Info from './info'
 import Participants from './participants'
@@ -36,6 +41,7 @@ import { CursorsPresence } from './cursors-presence'
 import { LayerPreview } from './layer-preview'
 import { SelectionBox } from './selection-box'
 import { SelectionTools } from './selection-tools'
+import Path from './layer-type/path'
 
 const MAX_LAYERS = 100
 
@@ -45,6 +51,9 @@ interface CanvasProps {
 
 export default function Canvas({ boardId }: CanvasProps) {
   const layerIds = useStorage((root) => root.layerIds)
+
+  const pencilDraft = useSelf((me) => me.presence.pencilDraft)
+
   const [canvasState, setCanvaseState] = useState<CanvasState>({
     mode: CanvasMode.None,
   })
@@ -56,6 +65,8 @@ export default function Canvas({ boardId }: CanvasProps) {
     g: 0,
     b: 0,
   })
+
+  useDisableScrollBounce()
 
   const history = useHistory()
   const canUndo = useCanUndo()
@@ -95,17 +106,131 @@ export default function Canvas({ boardId }: CanvasProps) {
     []
   )
 
+  const translateSelectedLayers = useMutation(
+    ({ storage, self }, point: Point) => {
+      if (canvasState.mode !== CanvasMode.Translating) return
+
+      const offset = {
+        x: point.x - canvasState.current.x,
+        y: point.y - canvasState.current.y,
+      }
+
+      const layers = storage.get('layers')
+
+      for (const id of self.presence.selection) {
+        const layer = layers.get(id)
+
+        if (layer) {
+          layer.update({
+            x: layer.get('x') + offset.x,
+            y: layer.get('y') + offset.y,
+          })
+        }
+      }
+
+      setCanvaseState({ mode: CanvasMode.Translating, current: point })
+    },
+    [canvasState]
+  )
+
+  const resizeSelectedLayer = useMutation(
+    ({ storage, self }, point: Point) => {
+      if (canvasState.mode !== CanvasMode.Resizing) return
+
+      const bounds = resizeBounds(
+        canvasState.initialBounds,
+        canvasState.corner,
+        point
+      )
+
+      const layers = storage.get('layers')
+      const layer = layers.get(self.presence.selection[0])
+
+      if (layer) {
+        layer.update(bounds)
+      }
+    },
+    [canvasState]
+  )
+
+  const startDrawing = useMutation(
+    ({ setMyPresence }, point: Point, pressure: number) => {
+      setMyPresence({
+        pencilDraft: [[point.x, point.y, pressure]],
+        penColor: lastUserColor,
+      })
+    },
+    [lastUserColor]
+  )
+
+  const continueDrawing = useMutation(
+    ({ self, setMyPresence }, point: Point, e: React.PointerEvent) => {
+      const { pencilDraft } = self.presence
+
+      if (
+        canvasState.mode !== CanvasMode.Pencil ||
+        e.buttons !== 1 ||
+        pencilDraft == null
+      ) {
+        return
+      }
+
+      setMyPresence({
+        cursor: point,
+        pencilDraft:
+          pencilDraft.length === 1 &&
+          pencilDraft[0][0] === point.x &&
+          pencilDraft[0][1] === point.y
+            ? pencilDraft
+            : [...pencilDraft, [point.x, point.y, e.pressure]],
+      })
+    },
+    [canvasState.mode]
+  )
+
+  const insertPath = useMutation(
+    ({ storage, self, setMyPresence }) => {
+      const layers = storage.get('layers')
+      const { pencilDraft } = self.presence
+
+      if (
+        pencilDraft == null ||
+        pencilDraft.length < 2 ||
+        layers.size >= MAX_LAYERS
+      ) {
+        setMyPresence({ pencilDraft: null })
+        return
+      }
+
+      const id = nanoid()
+      layers.set(
+        id,
+        new LiveObject(penPointsToPathLayer(pencilDraft, lastUserColor))
+      )
+
+      const layerIds = storage.get('layerIds')
+      layerIds.push(id)
+
+      setMyPresence({ pencilDraft: null })
+      setCanvaseState({ mode: CanvasMode.Pencil })
+    },
+    [lastUserColor]
+  )
+
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
       const point = pointerEventToCanvasPoint(e, camera)
 
       if (canvasState.mode === CanvasMode.Inserting) return
 
-      // TODO: add case for drawing
+      if (canvasState.mode === CanvasMode.Pencil) {
+        startDrawing(point, e.pressure)
+        return
+      }
 
       setCanvaseState({ mode: CanvasMode.Pressing, origin: point })
     },
-    [camera, canvasState.mode, setCanvaseState]
+    [camera, canvasState.mode, setCanvaseState, startDrawing]
   )
 
   const unSelectedLayer = useMutation(({ self, setMyPresence }) => {
@@ -128,6 +253,8 @@ export default function Canvas({ boardId }: CanvasProps) {
         setCanvaseState({
           mode: CanvasMode.None,
         })
+      } else if (canvasState.mode === CanvasMode.Pencil) {
+        insertPath()
       } else if (canvasState.mode === CanvasMode.Inserting) {
         insertLayer(canvasState.layerType, point)
       } else {
@@ -136,7 +263,15 @@ export default function Canvas({ boardId }: CanvasProps) {
 
       history.resume()
     },
-    [camera, canvasState, history, insertLayer, unSelectedLayer]
+    [
+      camera,
+      canvasState,
+      setCanvaseState,
+      history,
+      insertLayer,
+      unSelectedLayer,
+      insertPath,
+    ]
   )
 
   const selections = useOthersMapped((other) => other.presence.selection)
@@ -174,33 +309,6 @@ export default function Canvas({ boardId }: CanvasProps) {
     return layerIdsToColorSelection
   }, [selections])
 
-  const translateSelectedLayers = useMutation(
-    ({ storage, self }, point: Point) => {
-      if (canvasState.mode !== CanvasMode.Translating) return
-
-      const offset = {
-        x: point.x - canvasState.current.x,
-        y: point.y - canvasState.current.y,
-      }
-
-      const layers = storage.get('layers')
-
-      for (const id of self.presence.selection) {
-        const layer = layers.get(id)
-
-        if (layer) {
-          layer.update({
-            x: layer.get('x') + offset.x,
-            y: layer.get('y') + offset.y,
-          })
-        }
-      }
-
-      setCanvaseState({ mode: CanvasMode.Translating, current: point })
-    },
-    [canvasState]
-  )
-
   const updateSelectionNet = useMutation(
     ({ storage, setMyPresence }, current: Point, origin: Point) => {
       const layers = storage.get('layers').toImmutable()
@@ -232,25 +340,6 @@ export default function Canvas({ boardId }: CanvasProps) {
       })
     }
   }, [])
-  const resizeSelectedLayer = useMutation(
-    ({ storage, self }, point: Point) => {
-      if (canvasState.mode !== CanvasMode.Resizing) return
-
-      const bounds = resizeBounds(
-        canvasState.initialBounds,
-        canvasState.corner,
-        point
-      )
-
-      const layers = storage.get('layers')
-      const layer = layers.get(self.presence.selection[0])
-
-      if (layer) {
-        layer.update(bounds)
-      }
-    },
-    [canvasState]
-  )
 
   const onPointerMove = useMutation(
     ({ setMyPresence }, e: React.PointerEvent) => {
@@ -266,6 +355,8 @@ export default function Canvas({ boardId }: CanvasProps) {
         translateSelectedLayers(current)
       } else if (canvasState.mode === CanvasMode.Resizing) {
         resizeSelectedLayer(current)
+      } else if (canvasState.mode === CanvasMode.Pencil) {
+        continueDrawing(current, e)
       }
 
       setMyPresence({ cursor: current })
@@ -276,6 +367,8 @@ export default function Canvas({ boardId }: CanvasProps) {
       resizeSelectedLayer,
       startMultiSelection,
       updateSelectionNet,
+      translateSelectedLayers,
+      continueDrawing,
     ]
   )
 
@@ -297,6 +390,27 @@ export default function Canvas({ boardId }: CanvasProps) {
       y: camera.y - e.deltaY,
     }))
   }, [])
+
+  const deleteLayer = useDeleteLayers()
+  // undo and redo shortcut key
+  useEffect(() => {
+    function keyDown(e: KeyboardEvent) {
+      if (e.key === 'z') {
+        if (e.ctrlKey || e.metaKey) {
+          if (e.shiftKey) {
+            history.redo()
+          } else {
+            history.undo()
+          }
+        }
+      }
+    }
+
+    document.addEventListener('keydown', keyDown)
+    return () => {
+      document.removeEventListener('keydown', keyDown)
+    }
+  }, [deleteLayer, history])
 
   return (
     <main className="w-full h-full relative bg-neutral-100 touch-none">
@@ -344,6 +458,14 @@ export default function Canvas({ boardId }: CanvasProps) {
               />
             )}
           <CursorsPresence />
+          {pencilDraft !== null && pencilDraft.length > 0 && (
+            <Path
+              points={pencilDraft}
+              x={0}
+              y={0}
+              fill={rgbToHex(lastUserColor)}
+            />
+          )}
         </g>
       </svg>
     </main>
